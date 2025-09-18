@@ -1,0 +1,35 @@
+Lower chassis
+====================
+Top: 3 Layers
+Bottom: 3 Layers
+Walls: 3
+Infill: Gyroid, 15%
+Material: PA6-CF
+
+
+Chassis top
+====================
+Top: 4 Layers
+Bottom: 4 Layers
+Walls: 3
+Infill: Gyroid, 15%
+Material: PA6-CF
+
+
+Verbinder Ausleger
+====================
+Top: 4 Layers
+Bottom: 4 Layers
+Walls: 4
+Infill: Gyroid, 50%
+Material: ABS-GF
+
+
+Fuss
+=====================
+Top: 2 Layers
+Bottom: 3 Layers
+Walls: 2
+Infill: Gyroid, 15%
+Material: TPU
+
