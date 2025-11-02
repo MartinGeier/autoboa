@@ -86,14 +86,39 @@ double headingAlpha = 0.2;         // smoothing factor for heading, smoothing fa
 #define LED_BLUE_PIN 27
 
 
+// Motor control pins
+#define LEFT_MOTOR_PIN 18
+#define RIGHT_MOTOR_PIN 19
+
+// ESC neutral points (may need individual calibration)
+#define LEFT_MOTOR_NEUTRAL 1500
+#define RIGHT_MOTOR_NEUTRAL 1500  // Changed from 1480 - standard neutral is 1500
+
+// PWM Properties for ESP32
+const int pwmFrequency = 50;        // Standard PWM frequency for ESCs in Hz
+const int pwmResolution = 8;        // 8-bit resolution, giving a duty cycle range of 0-255
+
+// PWM channels (0-15 on ESP32)
+const int leftMotorChannel = 0;
+const int rightMotorChannel = 1;
+
+// Motor Objects
+Servo leftMotor;
+Servo rightMotor;
+
+
 void setup()
 {
   SerialMon.begin(9600);
   delay(2000);
 
+  // Initialize motor PWM channels
+  setupMotors();
+
   setup_wifi();
 
   mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
 
   Serial.println("Starting setup...");
   SerialGPS.begin(9600);
@@ -101,8 +126,7 @@ void setup()
   ArduinoOTA.begin();
 
   // compass setup
-  //Wire.begin();
-  Wire.begin();//SDAPIN, SCLPIN);
+  Wire.begin();
   compass.init();
   compass.enableDefault();
   /*
@@ -117,12 +141,12 @@ void setup()
   pinMode(LED_RED_PIN, OUTPUT);
   pinMode(LED_GREEN_PIN, OUTPUT);
   pinMode(LED_BLUE_PIN, OUTPUT);
-  
-  // Set up battery ADC pin
-  pinMode(BATT_ADC_PIN, INPUT);
 
   // Turn LED red initially to signal the bouy is acquiring GPS position
   setLedRed();
+
+  // Set up battery ADC pin
+  pinMode(BATT_ADC_PIN, INPUT);
 
   Serial.println("End of setup");
 }
@@ -416,12 +440,39 @@ void reconnect() {
     if (mqttClient.connect(clientId.c_str(), "", "", (baseTopicPath + "MqttState").c_str(), 0, true, "disconnected", false)) {
       Serial.println("connected");
       mqttClient.publish((baseTopicPath + "MqttState").c_str(), "connected", true);
+      
+      // Subscribe to command topics
+      mqttClient.subscribe((baseTopicPath + "testmotors").c_str());
+      Serial.println("Subscribed to testmotors topic");
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
       Serial.println(" retrying in 5 seconds");
       delay(5000);
     }
+  }
+}
+
+// MQTT callback function
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+  String message = "";
+  
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("Message received on topic: ");
+  Serial.print(topicStr);
+  Serial.print(" - Message: ");
+  Serial.println(message);
+  
+  // Check if it's the testmotors command
+  if (topicStr == baseTopicPath + "testmotors") {
+    Serial.println("Executing motor test...");
+    publishTopic("Log", "Starting motor test from MQTT command");
+    testMotors();
+    publishTopic("Log", "Motor test complete");
   }
 }
 
@@ -437,6 +488,120 @@ void publishTopic(String topicName, String message) {
   if(mqttClient.connected()) {
     mqttClient.publish((baseTopicPath + topicName).c_str(), message.c_str());
   }
+}
+
+// Motor control functions
+void setupMotors() {
+  Serial.println("Starting motor initialization...");
+
+  // Attach motors
+  leftMotor.attach(LEFT_MOTOR_PIN);
+  delay(100);
+  rightMotor.attach(RIGHT_MOTOR_PIN);
+  delay(100);
+  
+  Serial.println("Motors attached, setting to neutral...");
+  publishTopic("Log", "Setting motors to neutral positions...");
+
+  leftMotor.writeMicroseconds(2000);
+  rightMotor.writeMicroseconds(2000);
+  delay(3000); // Wait for ESCs to recognize full throttle
+
+  // Set directly to neutral - no calibration sequence
+  leftMotor.writeMicroseconds(LEFT_MOTOR_NEUTRAL);
+  rightMotor.writeMicroseconds(RIGHT_MOTOR_NEUTRAL);
+  delay(3000); // Wait for ESCs to recognize neutral
+  
+  Serial.println("ESC arming complete");
+  publishTopic("Log", "ESC arming complete");
+  
+  // Test each motor individually at very low speed
+  Serial.println("Testing left motor...");
+  publishTopic("Log", "Testing left motor...");
+  setLeftMotorSpeed(30);   // Very low speed test
+  delay(500);
+  setLeftMotorSpeed(0);
+  delay(1000);
+  
+  Serial.println("Testing right motor...");
+  publishTopic("Log", "Testing right motor...");
+  setRightMotorSpeed(30);   // Very low speed test
+  delay(500);
+  setRightMotorSpeed(0);
+  delay(1000);
+  
+  Serial.println("Motors initialized");
+  publishTopic("Log", "Motors initialized successfully");
+}
+
+/**
+ * @brief Sets the speed of the left motor.
+ * @param speed An integer from -100 (full reverse) to +100 (full forward), 0 is stopped.
+ */
+void setLeftMotorSpeed(int speed) {
+  // Constrain speed to -100 to +100 range
+  speed = constrain(speed, -100, 100);
+  
+  int pulseWidth;
+  if (speed == 0) {
+    // Neutral/stopped
+    pulseWidth = LEFT_MOTOR_NEUTRAL;
+  } else if (speed > 0) {
+    // Forward: map 1-100 to neutral+1 to 2000µs
+    pulseWidth = map(speed, 1, 100, LEFT_MOTOR_NEUTRAL + 1, 2000);
+  } else {
+    // Reverse: map -1 to -100 to neutral-1 to 1000µs
+    pulseWidth = map(speed, -1, -100, LEFT_MOTOR_NEUTRAL - 1, 1000);
+  }
+  
+  leftMotor.writeMicroseconds(pulseWidth);
+  
+  // Publish motor speed for monitoring
+  publishTopic("LeftMotorSpeed", speed);
+}
+
+/**
+ * @brief Sets the speed of the right motor.
+ * @param speed An integer from -100 (full reverse) to +100 (full forward), 0 is stopped.
+ */
+void setRightMotorSpeed(int speed) {
+  // Constrain speed to -100 to +100 range
+  speed = constrain(speed, -100, 100);
+  
+  int pulseWidth;
+  if (speed == 0) {
+    // Neutral/stopped
+    pulseWidth = RIGHT_MOTOR_NEUTRAL;
+  } else if (speed > 0) {
+    // Forward: map 1-100 to neutral+1 to 2000µs
+    pulseWidth = map(speed, 1, 100, RIGHT_MOTOR_NEUTRAL + 1, 2000);
+  } else {
+    // Reverse: map -1 to -100 to neutral-1 to 1000µs
+    pulseWidth = map(speed, -1, -100, RIGHT_MOTOR_NEUTRAL - 1, 1000);
+  }
+  
+  rightMotor.writeMicroseconds(pulseWidth);
+  
+  // Publish motor speed for monitoring
+  publishTopic("RightMotorSpeed", speed);
+}
+
+/**
+ * @brief Sets both motors to the same speed.
+ * @param speed An integer from -100 (full reverse) to +100 (full forward), 0 is stopped.
+ */
+void setBothMotorSpeed(int speed) {
+  setLeftMotorSpeed(speed);
+  setRightMotorSpeed(speed);
+}
+
+/**
+ * @brief Stops both motors immediately.
+ */
+void stopMotors() {
+  setLeftMotorSpeed(0);
+  setRightMotorSpeed(0);
+  publishTopic("Log", "Motors stopped");
 }
 
 // Set RGB LED colors
@@ -461,4 +626,34 @@ void setLedBlue() {
 
 void setLedOff() {
   setRGBLed(false, false, false);
+}
+
+void testMotors() {
+  setLeftMotorSpeed(30);
+  delay(1000);
+  setLeftMotorSpeed(0);
+  delay(1000); 
+  setLeftMotorSpeed(-30);
+  delay(1000);
+  setLeftMotorSpeed(0);
+  delay(1000);
+  setRightMotorSpeed(30);
+  delay(1000);
+  setRightMotorSpeed(0);
+  delay(1000);
+  setRightMotorSpeed(-30);
+  delay(1000);
+  setRightMotorSpeed(0);
+  delay(1000);
+  setLeftMotorSpeed(30);
+  setRightMotorSpeed(30);
+  delay(1000);
+  setLeftMotorSpeed(0);
+  setRightMotorSpeed(0);
+  delay(1000);
+  setLeftMotorSpeed(-30);
+  setRightMotorSpeed(-30);
+  delay(1000);  
+  setLeftMotorSpeed(0);
+  setRightMotorSpeed(0);
 }
