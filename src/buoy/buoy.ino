@@ -17,6 +17,7 @@
 // 3. Update the magnetic declination value in the readCompass() function below to match the location the buoy will be used
 // 4. Update the battery voltage correction value by measuring the actual battery voltage and 
 //    comparing it to the indicated value of the ADC
+// 5. Set the LEFT_MOTOR_DIRECTION and RIGHT_MOTOR_DIRECTION 
 
 #define SerialMon Serial
 
@@ -27,7 +28,7 @@ WiFiClient wifiClient;
 
 
 // MQTT Broker
-const char* mqtt_server = "broker.hivemq.com"; // Replace with your MQTT broker's address
+const char* mqtt_server = "broker.hivemq.com"; 
 const int mqtt_port = 1883; // Default MQTT port
 String baseTopicPath = "autoboa/";
 PubSubClient mqttClient(wifiClient);
@@ -53,7 +54,7 @@ int SCLPIN = 22;
 double lat,  lon;                         // working coordinates
 double smoothedLat = 0.0;
 double smoothedLon = 0.0;
-double gpsAlpha = 0.05;            // Smoothing factor between 0 and 1; higher is less smooth but more responsive
+#define GPS_ALPHA 0.05               // Smoothing factor between 0 and 1; higher is less smooth but more responsive
 double targetLat = 0.0;
 double targetLon = 0.0;
 double targetBearing = 0.0;        // current bearing to target
@@ -64,9 +65,10 @@ int hdop = 0;
 
 
 // compass
-double heading = 0.0;              // current heading of bouy
-double smoothedHeading = 0.0;      // smoothed heading
-double headingAlpha = 0.2;         // smoothing factor for heading, smoothing factor between 0 and 1; higher is less smooth but more responsive
+double heading = 0.0;                 // current heading of bouy
+double smoothedHeading = 0.0;         // smoothed heading
+#define HEADING_ALPHA 0.2             // smoothing factor for heading, smoothing factor between 0 and 1; higher is less smooth but more responsive
+#define COMPASS_READ_INTERVAL_MS 100  // Interval between compass readings in milliseconds
 
 
 // Battery
@@ -77,8 +79,26 @@ double headingAlpha = 0.2;         // smoothing factor for heading, smoothing fa
 
 
 // station keeping
-#define HOLDING_RADIUS 1.0         // Radius in meters for station-keeping
-#define DEAD_ZONE_RADIUS 0.5       // Radius in meters to stop oscillation near target
+#define HOLDING_RADIUS 2.0         // Radius in meters for station-keeping
+#define DEAD_ZONE_RADIUS 1.0       // Radius in meters to stop oscillation near target
+
+
+// PID Navigation
+#define HEADING_KP 2.0             // Proportional gain for heading correction
+#define HEADING_KI 0.1             // Integral gain for heading correction
+#define HEADING_KD 0.5             // Derivative gain for heading correction
+#define HEADING_TOLERANCE 10.0     // Degrees - acceptable heading error before moving forward
+#define MAX_MOTOR_SPEED 50         // Maximum motor speed (0-100)
+#define MIN_MOTOR_SPEED 20         // Minimum motor speed to overcome friction
+#define ROTATION_SPEED 30          // Speed for pure rotation
+
+double headingError = 0.0;
+double headingErrorIntegral = 0.0;
+double headingErrorPrevious = 0.0;
+unsigned long lastNavigationUpdate = 0;
+double navigationDeltaTime = 0.0;
+unsigned long lastHeadingErrorPublish = 0;
+
 
 // RGB LED pins
 #define LED_RED_PIN 25
@@ -92,19 +112,30 @@ double headingAlpha = 0.2;         // smoothing factor for heading, smoothing fa
 
 // ESC neutral points (may need individual calibration)
 #define LEFT_MOTOR_NEUTRAL 1500
-#define RIGHT_MOTOR_NEUTRAL 1500  // Changed from 1480 - standard neutral is 1500
+#define RIGHT_MOTOR_NEUTRAL 1500
 
-// PWM Properties for ESP32
-const int pwmFrequency = 50;        // Standard PWM frequency for ESCs in Hz
-const int pwmResolution = 8;        // 8-bit resolution, giving a duty cycle range of 0-255
-
-// PWM channels (0-15 on ESP32)
-const int leftMotorChannel = 0;
-const int rightMotorChannel = 1;
+// Motor direction (1 = normal, -1 = inverted)
+#define LEFT_MOTOR_DIRECTION 1
+#define RIGHT_MOTOR_DIRECTION -1
 
 // Motor Objects
 Servo leftMotor;
 Servo rightMotor;
+
+// Publish-on-change trackers
+int lastLeftMotorSpeed = 999;
+int lastRightMotorSpeed = 999;
+String lastNavigationState = "";
+String lastNavigationMode = "";
+String lastStopState = "";
+
+bool stopFlag = false;
+
+// Forward declarations for change-aware publishers
+void publishNavigationState(const String& state);
+void publishNavigationMode(const String& mode);
+void publishStopState(const String& state);
+void publishHeadingErrorIfDue(double value);
 
 
 void setup()
@@ -170,6 +201,9 @@ void loop()
 
   // set led
   setLed();
+
+  // navigate to target
+  navigateToTarget();
 
   ArduinoOTA.handle();
   delay(10);
@@ -255,6 +289,10 @@ void writeGpsInfo() {
   Serial.print("hdop: "); 
   Serial.print(hdop, 0);
   publishTopic("HDOP", hdop);
+  Serial.print("   |   ");
+  Serial.print("herr: ");
+  Serial.print(headingError, 1);
+  publishHeadingErrorIfDue(headingError);
   Serial.println();
 }
 
@@ -277,8 +315,8 @@ void smoothCoordinates(double newLat, double newLon) {
     smoothedLon = newLon;
   }
   else {
-    smoothedLat = gpsAlpha * newLat + (1 - gpsAlpha) * smoothedLat;
-    smoothedLon = gpsAlpha * newLon + (1 - gpsAlpha) * smoothedLon;
+    smoothedLat = GPS_ALPHA * newLat + (1 - GPS_ALPHA) * smoothedLat;
+    smoothedLon = GPS_ALPHA * newLon + (1 - GPS_ALPHA) * smoothedLon;
   }
 }
 
@@ -329,8 +367,8 @@ double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
 void readCompass() {
   static unsigned long lastCompassRead = 0;  // timing for compass readings
 
-  if (millis() - lastCompassRead < 1000) {
-    return; // read compass every second
+  if (millis() - lastCompassRead < COMPASS_READ_INTERVAL_MS) {
+    return; // enforce compass polling interval
   }
 
   Serial.println("Starting to read compass...");
@@ -385,8 +423,8 @@ void readCompass() {
     smoothedX = x;
     smoothedY = y;
   } else {
-    smoothedX = headingAlpha * x + (1 - headingAlpha) * smoothedX;
-    smoothedY = headingAlpha * y + (1 - headingAlpha) * smoothedY;
+    smoothedX = HEADING_ALPHA * x + (1 - HEADING_ALPHA) * smoothedX;
+    smoothedY = HEADING_ALPHA * y + (1 - HEADING_ALPHA) * smoothedY;
   }
 
   smoothedHeading = fmod((toDegrees(atan2(smoothedY, smoothedX)) + 360.0), 360.0);
@@ -444,6 +482,8 @@ void reconnect() {
       // Subscribe to command topics
       mqttClient.subscribe((baseTopicPath + "testmotors").c_str());
       Serial.println("Subscribed to testmotors topic");
+  mqttClient.subscribe((baseTopicPath + "stop").c_str());
+  Serial.println("Subscribed to stop topic");
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
@@ -467,6 +507,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print(" - Message: ");
   Serial.println(message);
   
+  if (topicStr == baseTopicPath + "stop") {
+    String normalized = message;
+    normalized.toLowerCase();
+
+    if (normalized == "clearstop" || normalized == "clear" || normalized == "0") {
+      if (stopFlag) {
+        stopFlag = false;
+        publishStopState("Cleared");
+        publishTopic("Log", "Stop flag cleared via MQTT");
+      }
+    } else {
+      if (!stopFlag) {
+        publishTopic("Log", "Stop flag set via MQTT");
+      }
+      stopFlag = true;
+      publishStopState("Engaged");
+      stopMotors();
+    }
+    return;
+  }
+
   // Check if it's the testmotors command
   if (topicStr == baseTopicPath + "testmotors") {
     Serial.println("Executing motor test...");
@@ -490,6 +551,35 @@ void publishTopic(String topicName, String message) {
   }
 }
 
+void publishNavigationState(const String& state) {
+  if (state != lastNavigationState) {
+    publishTopic("NavigationState", state);
+    lastNavigationState = state;
+  }
+}
+
+void publishNavigationMode(const String& mode) {
+  if (mode != lastNavigationMode) {
+    publishTopic("NavigationMode", mode);
+    lastNavigationMode = mode;
+  }
+}
+
+void publishStopState(const String& state) {
+  if (state != lastStopState) {
+    publishTopic("StopState", state);
+    lastStopState = state;
+  }
+}
+
+void publishHeadingErrorIfDue(double value) {
+  unsigned long now = millis();
+  if (lastHeadingErrorPublish == 0 || now - lastHeadingErrorPublish >= 1000) {
+    publishTopic("HeadingError", value);
+    lastHeadingErrorPublish = now;
+  }
+}
+
 // Motor control functions
 void setupMotors() {
   Serial.println("Starting motor initialization...");
@@ -503,9 +593,9 @@ void setupMotors() {
   Serial.println("Motors attached, setting to neutral...");
   publishTopic("Log", "Setting motors to neutral positions...");
 
-  leftMotor.writeMicroseconds(2000);
-  rightMotor.writeMicroseconds(2000);
-  delay(3000); // Wait for ESCs to recognize full throttle
+  // leftMotor.writeMicroseconds(2000);
+  // rightMotor.writeMicroseconds(2000);
+  // delay(3000); // Wait for ESCs to recognize full throttle
 
   // Set directly to neutral - no calibration sequence
   leftMotor.writeMicroseconds(LEFT_MOTOR_NEUTRAL);
@@ -515,20 +605,20 @@ void setupMotors() {
   Serial.println("ESC arming complete");
   publishTopic("Log", "ESC arming complete");
   
-  // Test each motor individually at very low speed
-  Serial.println("Testing left motor...");
-  publishTopic("Log", "Testing left motor...");
-  setLeftMotorSpeed(30);   // Very low speed test
-  delay(500);
-  setLeftMotorSpeed(0);
-  delay(1000);
+  // // Test each motor individually at very low speed
+  // Serial.println("Testing left motor...");
+  // publishTopic("Log", "Testing left motor...");
+  // setLeftMotorSpeed(30);   // Very low speed test
+  // delay(500);
+  // setLeftMotorSpeed(0);
+  // delay(1000);
   
-  Serial.println("Testing right motor...");
-  publishTopic("Log", "Testing right motor...");
-  setRightMotorSpeed(30);   // Very low speed test
-  delay(500);
-  setRightMotorSpeed(0);
-  delay(1000);
+  // Serial.println("Testing right motor...");
+  // publishTopic("Log", "Testing right motor...");
+  // setRightMotorSpeed(30);   // Very low speed test
+  // delay(500);
+  // setRightMotorSpeed(0);
+  // delay(1000);
   
   Serial.println("Motors initialized");
   publishTopic("Log", "Motors initialized successfully");
@@ -541,23 +631,32 @@ void setupMotors() {
 void setLeftMotorSpeed(int speed) {
   // Constrain speed to -100 to +100 range
   speed = constrain(speed, -100, 100);
-  
+
+  if (stopFlag) {
+    speed = 0;
+  }
+
+  int effectiveSpeed = speed * LEFT_MOTOR_DIRECTION;
+
   int pulseWidth;
-  if (speed == 0) {
+  if (effectiveSpeed == 0) {
     // Neutral/stopped
     pulseWidth = LEFT_MOTOR_NEUTRAL;
-  } else if (speed > 0) {
+  } else if (effectiveSpeed > 0) {
     // Forward: map 1-100 to neutral+1 to 2000µs
-    pulseWidth = map(speed, 1, 100, LEFT_MOTOR_NEUTRAL + 1, 2000);
+    pulseWidth = map(effectiveSpeed, 1, 100, LEFT_MOTOR_NEUTRAL + 1, 2000);
   } else {
     // Reverse: map -1 to -100 to neutral-1 to 1000µs
-    pulseWidth = map(speed, -1, -100, LEFT_MOTOR_NEUTRAL - 1, 1000);
+    pulseWidth = map(effectiveSpeed, -1, -100, LEFT_MOTOR_NEUTRAL - 1, 1000);
   }
   
   leftMotor.writeMicroseconds(pulseWidth);
   
-  // Publish motor speed for monitoring
-  publishTopic("LeftMotorSpeed", speed);
+  // Publish motor speed for monitoring only if it changed
+  if (speed != lastLeftMotorSpeed) {
+    publishTopic("LeftMotorSpeed", speed);
+    lastLeftMotorSpeed = speed;
+  }
 }
 
 /**
@@ -567,23 +666,32 @@ void setLeftMotorSpeed(int speed) {
 void setRightMotorSpeed(int speed) {
   // Constrain speed to -100 to +100 range
   speed = constrain(speed, -100, 100);
-  
+
+  if (stopFlag) {
+    speed = 0;
+  }
+
+  int effectiveSpeed = speed * RIGHT_MOTOR_DIRECTION;
+
   int pulseWidth;
-  if (speed == 0) {
+  if (effectiveSpeed == 0) {
     // Neutral/stopped
     pulseWidth = RIGHT_MOTOR_NEUTRAL;
-  } else if (speed > 0) {
+  } else if (effectiveSpeed > 0) {
     // Forward: map 1-100 to neutral+1 to 2000µs
-    pulseWidth = map(speed, 1, 100, RIGHT_MOTOR_NEUTRAL + 1, 2000);
+    pulseWidth = map(effectiveSpeed, 1, 100, RIGHT_MOTOR_NEUTRAL + 1, 2000);
   } else {
     // Reverse: map -1 to -100 to neutral-1 to 1000µs
-    pulseWidth = map(speed, -1, -100, RIGHT_MOTOR_NEUTRAL - 1, 1000);
+    pulseWidth = map(effectiveSpeed, -1, -100, RIGHT_MOTOR_NEUTRAL - 1, 1000);
   }
   
   rightMotor.writeMicroseconds(pulseWidth);
   
-  // Publish motor speed for monitoring
-  publishTopic("RightMotorSpeed", speed);
+  // Publish motor speed for monitoring only if it changed
+  if (speed != lastRightMotorSpeed) {
+    publishTopic("RightMotorSpeed", speed);
+    lastRightMotorSpeed = speed;
+  }
 }
 
 /**
@@ -601,7 +709,6 @@ void setBothMotorSpeed(int speed) {
 void stopMotors() {
   setLeftMotorSpeed(0);
   setRightMotorSpeed(0);
-  publishTopic("Log", "Motors stopped");
 }
 
 // Set RGB LED colors
@@ -628,32 +735,157 @@ void setLedOff() {
   setRGBLed(false, false, false);
 }
 
+// Navigation PID Controller
+void navigateToTarget() {
+  if (stopFlag) {
+    stopMotors();
+    publishNavigationState("Stopped");
+    return;
+  }
+
+  // Don't navigate if we don't have a target yet
+  if (targetLat == 0.0 || pointCounter <= TARGET_POINT_COUNT) {
+    stopMotors();
+    return;
+  }
+
+  // Calculate time delta for PID
+  unsigned long currentTime = millis();
+  if (lastNavigationUpdate == 0) {
+    lastNavigationUpdate = currentTime;
+    return;
+  }
+  navigationDeltaTime = (currentTime - lastNavigationUpdate) / 1000.0; // Convert to seconds
+  lastNavigationUpdate = currentTime;
+
+  // Check if we're in the dead zone - stop motors
+  if (targetDistance <= DEAD_ZONE_RADIUS) {
+    stopMotors();
+    headingErrorIntegral = 0.0; // Reset integral when stopped
+    publishNavigationState("In Dead Zone");
+    return;
+  }
+
+  // Navigate back to target or fine-tune position
+  if (targetDistance > HOLDING_RADIUS) {
+    publishNavigationState("Navigating to Target");
+  } else {
+    publishNavigationState("Fine Positioning");
+  }
+  performPIDNavigation();
+}
+
+void performPIDNavigation() {
+  // Calculate heading error (shortest angle difference)
+  headingError = normalizeAngle(targetBearing - smoothedHeading);
+  
+  // Update integral term with anti-windup
+  headingErrorIntegral += headingError * navigationDeltaTime;
+  headingErrorIntegral = constrain(headingErrorIntegral, -100, 100);
+  
+  // Calculate derivative term
+  double headingErrorDerivative = 0.0;
+  if (navigationDeltaTime > 0) {
+    headingErrorDerivative = (headingError - headingErrorPrevious) / navigationDeltaTime;
+  }
+  headingErrorPrevious = headingError;
+  
+  // Calculate PID output
+  double pidOutput = (HEADING_KP * headingError) + 
+                     (HEADING_KI * headingErrorIntegral) + 
+                     (HEADING_KD * headingErrorDerivative);
+  
+  // Determine if we need to rotate in place or move forward with steering
+  if (abs(headingError) > HEADING_TOLERANCE) {
+    // Heading error is large - rotate in place
+    rotateInPlace(pidOutput);
+    publishNavigationMode("Rotating");
+  } else {
+    // Heading is good - move forward with steering correction
+    //moveForwardWithSteering(pidOutput);
+    publishNavigationMode("Moving Forward");
+  }
+  
+  // Publish debug info
+  publishHeadingErrorIfDue(headingError);
+  publishTopic("PIDOutput", pidOutput);
+}
+
+void rotateInPlace(double pidOutput) {
+  // Rotate in place - motors turn in opposite directions
+  int rotationSpeed = constrain(abs(pidOutput), MIN_MOTOR_SPEED, ROTATION_SPEED);
+  
+  if (pidOutput < 0) {
+    // Turn right: left motor forward, right motor backward
+    setLeftMotorSpeed(rotationSpeed);
+    setRightMotorSpeed(-rotationSpeed);
+  } else {
+    // Turn left: left motor backward, right motor forward
+    setLeftMotorSpeed(-rotationSpeed);
+    setRightMotorSpeed(rotationSpeed);
+  }
+}
+
+void moveForwardWithSteering(double pidOutput) {
+  // Calculate base speed based on distance (slow down as we approach target)
+  int baseSpeed = MAX_MOTOR_SPEED;
+  if (targetDistance < HOLDING_RADIUS) {
+    // Slow down when close to target
+    baseSpeed = map(targetDistance * 100, DEAD_ZONE_RADIUS * 100, HOLDING_RADIUS * 100, 
+                    MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  }
+  
+  // Apply steering correction from PID
+  int steeringCorrection = constrain(pidOutput, -baseSpeed/2, baseSpeed/2);
+  
+  int leftSpeed = constrain(baseSpeed - steeringCorrection, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  int rightSpeed = constrain(baseSpeed + steeringCorrection, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  
+  // Ensure minimum speed to overcome friction
+  if (abs(leftSpeed) > 0 && abs(leftSpeed) < MIN_MOTOR_SPEED) {
+    leftSpeed = (leftSpeed > 0) ? MIN_MOTOR_SPEED : -MIN_MOTOR_SPEED;
+  }
+  if (abs(rightSpeed) > 0 && abs(rightSpeed) < MIN_MOTOR_SPEED) {
+    rightSpeed = (rightSpeed > 0) ? MIN_MOTOR_SPEED : -MIN_MOTOR_SPEED;
+  }
+  
+  setLeftMotorSpeed(leftSpeed);
+  setRightMotorSpeed(rightSpeed);
+}
+
+// Normalize angle to -180 to +180 range
+double normalizeAngle(double angle) {
+  while (angle > 180.0) angle -= 360.0;
+  while (angle < -180.0) angle += 360.0;
+  return angle;
+}
+
 void testMotors() {
   setLeftMotorSpeed(30);
-  delay(1000);
+  delay(3000);
   setLeftMotorSpeed(0);
-  delay(1000); 
+  delay(3000); 
   setLeftMotorSpeed(-30);
-  delay(1000);
+  delay(3000);
   setLeftMotorSpeed(0);
-  delay(1000);
+  delay(3000);
   setRightMotorSpeed(30);
-  delay(1000);
+  delay(3000);
   setRightMotorSpeed(0);
-  delay(1000);
+  delay(3000);
   setRightMotorSpeed(-30);
-  delay(1000);
+  delay(3000);
   setRightMotorSpeed(0);
-  delay(1000);
+  delay(3000);
   setLeftMotorSpeed(30);
   setRightMotorSpeed(30);
-  delay(1000);
+  delay(3000);
   setLeftMotorSpeed(0);
   setRightMotorSpeed(0);
-  delay(1000);
+  delay(3000);
   setLeftMotorSpeed(-30);
   setRightMotorSpeed(-30);
-  delay(1000);  
+  delay(3000);  
   setLeftMotorSpeed(0);
   setRightMotorSpeed(0);
 }
